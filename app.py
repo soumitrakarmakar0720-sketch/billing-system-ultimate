@@ -242,6 +242,18 @@ def create_order():
 def checkout(token): return render_template('checkout.html', order=order_for_token(token), gateway_enabled=bool(CF_ID and CF_SECRET))
 
 
+@app.route('/customer/bills', methods=['GET', 'POST'])
+def customer_bills():
+    matches = None
+    if request.method == 'POST':
+        phone = request.form.get('phone', '').strip()
+        if not re.fullmatch(r'[0-9]{10}', phone):
+            flash('Enter a valid 10-digit mobile number', 'error')
+        else:
+            matches = Order.query.filter_by(phone=phone).order_by(Order.created_at.desc()).limit(50).all()
+    return render_template('customer_bills.html', matches=matches)
+
+
 @app.get('/qr/<token>.png')
 def qr_image(token):
     order = order_for_token(token)
