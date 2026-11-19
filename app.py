@@ -157,7 +157,8 @@ def upi_uri(order):
 
 
 @app.get('/')
-def home(): return redirect(url_for('dashboard') if session.get('user_id') else url_for('login'))
+def home():
+    return render_template('customer_bills.html', matches=None)
 
 
 @app.route('/login', methods=['GET', 'POST'])
