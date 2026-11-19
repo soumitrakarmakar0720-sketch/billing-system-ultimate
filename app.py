@@ -376,7 +376,7 @@ def cashfree_start(token):
         order.gateway_order_id = 'owlu_' + str(order.id) + '_' + secrets.token_hex(5)
         db.session.commit()
     # Gateway order ID is stable; repeated calls use Cashfree's existing order where possible.
-    payload = {'order_id': order.gateway_order_id, 'order_amount': float(order.total), 'order_currency': 'INR', 'customer_details': {'customer_id': f'owl_{order.id}', 'customer_name': order.customer[:100], 'customer_phone': order.phone}, 'order_meta': {'return_url': url_for('checkout', token=token, _external=True)}}
+    payload = {'order_id': order.gateway_order_id, 'order_amount': float(order.total), 'order_currency': 'INR', 'customer_details': {'customer_id': f'owl_{order.id}', 'customer_name': order.customer[:100], 'customer_phone': order.phone}, 'order_meta': {'return_url': url_for('checkout', token=token, _external=True), 'notify_url': url_for('cashfree_webhook', _external=True)}}
     try:
         response = requests.post(CF_BASE+'/orders', headers=cf_headers(), json=payload, timeout=12)
         if response.status_code == 409:
@@ -402,6 +402,7 @@ def verify_cf_webhook(raw, timestamp, signature):
 
 
 @app.post('/webhooks/cashfree')
+@app.post('/cashfree/webhook')
 def cashfree_webhook():
     raw = request.get_data()
     if not verify_cf_webhook(raw, request.headers.get('x-webhook-timestamp', ''), request.headers.get('x-webhook-signature', '')): abort(401)
@@ -415,7 +416,8 @@ def cashfree_webhook():
     # Cashfree amount must be compared to the original order; never trust a browser redirect.
     try: received = money(payment.get('payment_amount', '-1'))
     except (InvalidOperation, ValueError): received = D('-1')
-    if payment_status != 'SUCCESS' or received != money(order.total): return jsonify(ok=True)
+    if data.get('type') != 'PAYMENT_SUCCESS_WEBHOOK' or payment_status != 'SUCCESS' or received != money(order.total): return jsonify(ok=True)
+    if order_info.get('order_currency', 'INR') != 'INR': return jsonify(ok=True)
     event_id = str(payment.get('cf_payment_id') or '')
     if not event_id: return jsonify(ok=True)
     event_key = hashlib.sha256(f'{gateway_id}:{event_id}:SUCCESS'.encode()).hexdigest()
@@ -424,7 +426,12 @@ def cashfree_webhook():
     if order.status != 'PAID':
         order.status = 'PAID'; order.payment_ref = event_id
         log('GATEWAY_PAYMENT_CONFIRMED', order, event_id, actor='cashfree')
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('Cashfree webhook database update failed')
+        return jsonify(ok=False), 500
     return jsonify(ok=True)
 
 
