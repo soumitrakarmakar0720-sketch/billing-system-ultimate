@@ -1,14 +1,6 @@
-import os
-from flask import Flask
 
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ["SECRET_KEY"]
 
-# Other configuration and extensions go here.
-
-# Routes must come after app is initialized.
-@app.get("/staff")
-def staff():
+@app.get('/staff')
 @auth('admin')
 def staff(): return render_template('staff.html', users=User.query.order_by(User.id).all())
 
