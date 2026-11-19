@@ -41,6 +41,12 @@ CF_ID = os.environ.get('CASHFREE_CLIENT_ID', '')
 CF_SECRET = os.environ.get('CASHFREE_CLIENT_SECRET', '')
 CF_ENV = os.environ.get('CASHFREE_ENV', 'sandbox')
 CF_BASE = 'https://api.cashfree.com/pg' if CF_ENV == 'production' else 'https://sandbox.cashfree.com/pg'
+app.logger.warning(
+    "CASHFREE CHECK: ID=%s SECRET=%s ENV=%s",
+    bool(CF_ID),
+    bool(CF_SECRET),
+    CF_ENV
+)
 
 
 def now(): return datetime.now(timezone.utc)
