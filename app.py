@@ -1,4 +1,10 @@
+import os
+from flask import Flask
 
+app = Flask(__name__)
+
+# Existing configuration, database models,
+# authentication functions, etc. belong here.
 
 @app.get('/staff')
 @auth('admin')
