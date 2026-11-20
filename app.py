@@ -7,7 +7,7 @@ import io
 import os
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
 from urllib.parse import quote, urlparse
@@ -85,6 +85,13 @@ class Order(db.Model):
     gateway_order_id = db.Column(db.String(90), unique=True)
     created_at = db.Column(db.DateTime(timezone=True), default=now, nullable=False)
     items = db.relationship('OrderItem', backref='order', cascade='all, delete-orphan', lazy='select')
+    deleted_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    deleted_by = db.Column(db.String(100), nullable=True)
+    parent_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=True, index=True)
+    installment_number = db.Column(db.Integer, nullable=True)
+    due_date = db.Column(db.Date, nullable=True)
+    emi_months = db.Column(db.Integer, nullable=True)
+    installments = db.relationship('Order', backref=db.backref('parent_order', remote_side='Order.id'), lazy='select')
 
 
 class OrderItem(db.Model):
@@ -149,7 +156,7 @@ def auth(role=None):
 
 
 def order_for_token(token):
-    return Order.query.filter_by(public_token=token).first_or_404()
+    return Order.query.filter_by(public_token=token, deleted_at=None).filter(Order.status != 'EMI_PLAN').first_or_404()
 
 
 def upi_uri(order):
@@ -180,8 +187,8 @@ def logout(): session.clear(); return redirect(url_for('login'))
 @app.get('/dashboard')
 @auth()
 def dashboard():
-    stats = dict(sales=Order.query.count(), revenue=db.session.query(func.coalesce(func.sum(Order.total), 0)).filter_by(status='PAID').scalar(), pending=Order.query.filter(Order.status.in_(['PENDING', 'PAYMENT_REPORTED'])).count(), products=Product.query.filter_by(active=True).count())
-    return render_template('dashboard.html', stats=stats, orders=Order.query.order_by(Order.id.desc()).limit(8).all())
+    stats = dict(sales=Order.query.filter(Order.deleted_at.is_(None), Order.status != 'EMI_PLAN').count(), revenue=db.session.query(func.coalesce(func.sum(Order.total), 0)).filter(Order.status == 'PAID', Order.deleted_at.is_(None)).scalar(), pending=Order.query.filter(Order.status.in_(['PENDING', 'PAYMENT_REPORTED']), Order.deleted_at.is_(None)).count(), products=Product.query.filter_by(active=True).count())
+    return render_template('dashboard.html', stats=stats, orders=Order.query.filter(Order.deleted_at.is_(None), Order.status != 'EMI_PLAN').order_by(Order.id.desc()).limit(8).all())
 
 
 @app.route('/products', methods=['GET', 'POST'])
@@ -232,15 +239,41 @@ def create_order():
         if discount > subtotal: raise ValueError()
         tax = money((subtotal - discount) * tax_rate / 100)
         order = Order(order_no='OWL-'+now().strftime('%y%m%d')+'-'+secrets.token_hex(4).upper(), customer=customer, phone=phone[:20], subtotal=subtotal, discount=discount, tax_rate=tax_rate, tax=tax, total=subtotal-discount+tax, status='PENDING', public_token=secrets.token_urlsafe(32), items=items)
-        db.session.add(order); db.session.flush(); log('ORDER_CREATED', order); db.session.commit()
-        return redirect(url_for('checkout', token=order.public_token))
-    except (ValueError, InvalidOperation, KeyError, TypeError):
-        db.session.rollback(); flash('Check customer, quantities, discount and tax', 'error')
+        emi_months = int(request.form.get('emi_months', '1'))
+        if emi_months not in (1, 3, 6, 9, 12, 18, 24, 36): raise ValueError()
+        if emi_months > 1 and (order.total <= 0 or order.total < D('0.01') * emi_months): raise ValueError()
+        db.session.add(order); db.session.flush()
+        if emi_months > 1:
+            order.status = 'EMI_PLAN'  # Parent is a summary, never payable or counted as revenue.
+            order.emi_months = emi_months
+            start_text = request.form.get('first_due_date', '').strip()
+            first_due = date.fromisoformat(start_text) if start_text else now().date()
+            if first_due < now().date(): raise ValueError()
+            cents = int((money(order.total) * 100).to_integral_value())
+            share, remainder = divmod(cents, emi_months)
+            for i in range(emi_months):
+                year = first_due.year + (first_due.month - 1 + i) // 12
+                month = (first_due.month - 1 + i) % 12 + 1
+                from calendar import monthrange
+                due = date(year, month, min(first_due.day, monthrange(year, month)[1]))
+                part = D(share + (remainder if i == emi_months - 1 else 0)) / 100
+                child = Order(order_no=f'{order.order_no}-EMI{i+1:02d}', customer=order.customer, phone=order.phone, email=order.email, subtotal=part, discount=0, tax_rate=0, tax=0, total=part, status='PENDING', public_token=secrets.token_urlsafe(32), parent_order_id=order.id, installment_number=i+1, due_date=due)
+                db.session.add(child)
+            log('EMI_PLAN_CREATED', order, f'{emi_months} installments')
+        else:
+            log('ORDER_CREATED', order)
+        db.session.commit()
+        return redirect(url_for('emi_detail', order_id=order.id) if emi_months > 1 else url_for('checkout', token=order.public_token))
+    except (ValueError, InvalidOperation, KeyError, TypeError, OverflowError):
+        db.session.rollback(); flash('Check customer, quantities, discount, tax and EMI schedule', 'error')
         return redirect(url_for('new_bill'))
 
 
 @app.get('/pay/<token>')
-def checkout(token): return render_template('checkout.html', order=order_for_token(token), gateway_enabled=bool(CF_ID and CF_SECRET))
+def checkout(token):
+    order = order_for_token(token)
+    if order.deleted_at or order.status == 'EMI_PLAN': abort(404)
+    return render_template('checkout.html', order=order, gateway_enabled=bool(CF_ID and CF_SECRET))
 
 
 @app.route('/customer/bills', methods=['GET', 'POST'])
@@ -251,7 +284,7 @@ def customer_bills():
         if not re.fullmatch(r'[0-9]{10}', phone):
             flash('Enter a valid 10-digit mobile number', 'error')
         else:
-            matches = Order.query.filter_by(phone=phone).order_by(Order.created_at.desc()).limit(50).all()
+            matches = Order.query.filter_by(phone=phone, deleted_at=None).filter(Order.status != 'EMI_PLAN').order_by(Order.created_at.desc()).limit(50).all()
     return render_template('customer_bills.html', matches=matches)
 
 
@@ -277,13 +310,14 @@ def report_payment(token):
 
 @app.get('/orders')
 @auth()
-def orders(): return render_template('orders.html', orders=Order.query.order_by(Order.id.desc()).limit(300).all())
+def orders(): return render_template('orders.html', orders=Order.query.filter(Order.deleted_at.is_(None), Order.status != 'EMI_PLAN').order_by(Order.id.desc()).limit(300).all())
 
 
 @app.post('/orders/<int:order_id>/status')
 @auth('admin')
 def update_status(order_id):
     order = db.get_or_404(Order, order_id); action = request.form.get('action')
+    if order.deleted_at or order.status == 'EMI_PLAN': abort(409)
     if action not in ('confirm', 'reject'): abort(400)
     if order.status == 'PAID': abort(409, 'Paid orders cannot be changed using manual approval')
     if order.status not in ('PAYMENT_REPORTED', 'PAYMENT_REJECTED'):
@@ -367,6 +401,7 @@ def cf_headers():
 def cashfree_start(token):
     if not (CF_ID and CF_SECRET): abort(503, 'Cashfree not configured')
     order = order_for_token(token)
+    if order.deleted_at or order.status == 'EMI_PLAN': abort(409)
     if order.status == 'PAID': abort(409)
     if order.total <= 0: abort(400)
     if not re.fullmatch(r'\d{10}', order.phone or ''):
@@ -434,6 +469,67 @@ def cashfree_webhook():
         return jsonify(ok=False), 500
     return jsonify(ok=True)
 
+
+
+
+@app.get('/emi/<int:order_id>')
+@auth()
+def emi_detail(order_id):
+    parent = db.get_or_404(Order, order_id)
+    if parent.status != 'EMI_PLAN' or parent.deleted_at: abort(404)
+    parts = Order.query.filter_by(parent_order_id=parent.id).order_by(Order.installment_number).all()
+    paid = sum((money(x.total) for x in parts if x.status == 'PAID'), D('0'))
+    return render_template('emi_detail.html', parent=parent, parts=parts, paid=paid)
+
+
+@app.get('/emi')
+@auth()
+def emi_list():
+    plans = Order.query.filter_by(status='EMI_PLAN', deleted_at=None).order_by(Order.id.desc()).all()
+    return render_template('emi_list.html', plans=plans)
+
+
+@app.post('/orders/<int:order_id>/delete')
+@auth('admin')
+def delete_bill(order_id):
+    order = db.get_or_404(Order, order_id)
+    if order.deleted_at: abort(409)
+    if request.form.get('confirm') != order.order_no: abort(400, 'Enter the exact bill number')
+    if order.status in ('PAID', 'PAYMENT_REPORTED') or (order.status == 'EMI_PLAN' and any(x.status in ('PAID', 'PAYMENT_REPORTED') for x in order.installments)):
+        abort(409, 'Paid bills and plans with paid installments cannot be deleted')
+    if order.status == 'EMI_PLAN':
+        if any(x.gateway_order_id or x.payment_ref for x in order.installments): abort(409, 'Plan contains payment activity')
+        for child in order.installments:
+            child.deleted_at = now(); child.deleted_by = str(session.get('user_id'))
+    elif order.gateway_order_id or order.payment_ref:
+        abort(409, 'Bills with gateway payment attempts cannot be deleted')
+    order.deleted_at = now(); order.deleted_by = str(session.get('user_id'))
+    log('BILL_SOFT_DELETED', order)
+    db.session.commit()
+    flash('Bill moved to Trash', 'success')
+    return redirect(url_for('orders'))
+
+
+@app.get('/trash')
+@auth('admin')
+def trash():
+    deleted = Order.query.filter(Order.deleted_at.isnot(None), Order.parent_order_id.is_(None)).order_by(Order.deleted_at.desc()).all()
+    return render_template('trash.html', orders=deleted)
+
+
+@app.post('/orders/<int:order_id>/restore')
+@auth('admin')
+def restore_bill(order_id):
+    order = db.get_or_404(Order, order_id)
+    if not order.deleted_at or order.parent_order_id: abort(409)
+    order.deleted_at = None; order.deleted_by = None
+    if order.status == 'EMI_PLAN':
+        for child in order.installments:
+            child.deleted_at = None; child.deleted_by = None
+    log('BILL_RESTORED', order)
+    db.session.commit()
+    flash('Bill restored', 'success')
+    return redirect(url_for('trash'))
 
 @app.get('/health')
 def health():
